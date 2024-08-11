@@ -25,24 +25,38 @@ const OrdinalCreator: React.FC = () => {
   const [walletConnected, setWalletConnected] = useState<boolean>(false);
   const [publicKey, setPublicKey] = useState<string | null>(null);
   const [balance, setBalance] = useState<number | null>(null);
+  const [isTestnet, setIsTestnet] = useState<boolean>(true);
+  const [confirmedBalance, setConfirmedBalance] = useState<number | null>(null);
+  const [unconfirmedBalance, setUnconfirmedBalance] = useState<number | null>(null);
 
   useEffect(() => {
     checkWalletConnection();
   }, []);
 
   const checkWalletConnection = () => {
-    // With sats-connect, we don't need to check for specific wallet providers
     setWalletConnected(!!publicKey);
   };
 
+  const getNetworkType = (): BitcoinNetworkType => {
+    return isTestnet ? BitcoinNetworkType.Testnet : BitcoinNetworkType.Mainnet;
+  };
+
+  const getBlockstreamApiUrl = (): string => {
+    return isTestnet ? 'https://blockstream.info/testnet/api' : 'https://blockstream.info/api';
+  };
 
   const checkBalance = async (address: string) => {
     try {
-      const response = await axios.get(`https://blockstream.info/api/address/${address}`);
-      setBalance(response.data.chain_stats.funded_txo_sum - response.data.chain_stats.spent_txo_sum);
+      const response = await axios.get(`${getBlockstreamApiUrl()}/address/${address}`);
+      const confirmedBalance = response.data.chain_stats.funded_txo_sum - response.data.chain_stats.spent_txo_sum;
+      const totalBalance = response.data.mempool_stats.funded_txo_sum - response.data.mempool_stats.spent_txo_sum + confirmedBalance;
+      
+      setConfirmedBalance(confirmedBalance);
+      setUnconfirmedBalance(totalBalance - confirmedBalance);
     } catch (error) {
       console.error('Error fetching balance:', error);
-      setBalance(null);
+      setConfirmedBalance(null);
+      setUnconfirmedBalance(null);
     }
   };
 
@@ -53,7 +67,7 @@ const OrdinalCreator: React.FC = () => {
           purposes: [AddressPurpose.Ordinals, AddressPurpose.Payment],
           message: 'Address for receiving ordinals and payment',
           network: {
-            type: BitcoinNetworkType.Mainnet
+            type: getNetworkType()
           },
         },
         onFinish: (response: { addresses: { address: string; }[]; }) => {
@@ -101,14 +115,12 @@ const OrdinalCreator: React.FC = () => {
     setIsLoading(true);
 
     try {
-      // 1. Prepare the ordinal data
       const ordinalData = {
         content: content,
         fileType: file ? file.type : 'text/plain',
         fileData: file ? await fileToBase64(file) : null,
       };
 
-      // 2. Get the transaction details from the backend
       const txResponse = await fetch('http://localhost:3002/api/prepare-ordinal-tx', {
         method: 'POST',
         headers: {
@@ -117,6 +129,7 @@ const OrdinalCreator: React.FC = () => {
         body: JSON.stringify({
           ...ordinalData,
           address: publicKey,
+          isTestnet: isTestnet,
         }),
       });
 
@@ -127,25 +140,23 @@ const OrdinalCreator: React.FC = () => {
       const txDetails = await txResponse.json();
       console.log('Received PSBT from backend:', txDetails.psbt);
 
-      // 3. Sign the transaction with the user's wallet
       const signPsbtOptions: SignTransactionOptions = {
         payload: {
           network: {
-            type: BitcoinNetworkType.Mainnet
+            type: getNetworkType()
           },
           message: 'Sign transaction to create Bitcoin Ordinal',
           psbtBase64: txDetails.psbt,
           broadcast: false,
           inputsToSign: [
             {
-              address: publicKey!,
+              address: publicKey,
               signingIndexes: [0],
             },
           ],
         },
         onFinish: (response: { psbtBase64: string; }) => {
           console.log('Signed transaction:', response);
-          // 4. Send the signed transaction to the backend for broadcasting
           broadcastTransaction(response.psbtBase64);
         },
         onCancel: () => {
@@ -169,7 +180,7 @@ const OrdinalCreator: React.FC = () => {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ signedTx: signedPsbtBase64 }),
+      body: JSON.stringify({ signedTx: signedPsbtBase64, isTestnet: isTestnet }),
     });
 
     if (!broadcastResponse.ok) {
@@ -178,7 +189,6 @@ const OrdinalCreator: React.FC = () => {
 
     const broadcastResult = await broadcastResponse.json();
 
-    // 5. Add the new ordinal to the list
     const newOrdinal: Ordinal = {
       id: broadcastResult.txid,
       content: content,
@@ -191,7 +201,6 @@ const OrdinalCreator: React.FC = () => {
 
     setOrdinals([...ordinals, newOrdinal]);
 
-    // Reset form
     setContent('');
     setFile(null);
     setPreview('');
@@ -208,12 +217,25 @@ const OrdinalCreator: React.FC = () => {
     });
   };
 
+  const toggleNetwork = () => {
+    setIsTestnet(!isTestnet);
+    setWalletConnected(false);
+    setPublicKey(null);
+    setBalance(null);
+  };
+
   return (
     <Card className="w-full max-w-md mx-auto">
       <CardHeader>
         <CardTitle>Create Bitcoin Ordinal</CardTitle>
       </CardHeader>
       <CardContent>
+        <div className="mb-4">
+          <Button onClick={toggleNetwork} className="w-full mb-2">
+            Switch to {isTestnet ? 'Mainnet' : 'Testnet'}
+          </Button>
+          <p>Current network: {isTestnet ? 'Testnet' : 'Mainnet'}</p>
+        </div>
         {!walletConnected ? (
           <Button onClick={connectWallet} className="w-full mb-4">
             Connect Wallet
@@ -221,7 +243,8 @@ const OrdinalCreator: React.FC = () => {
         ) : (
           <div className="mb-4">
             <p>Wallet Connected: {publicKey}</p>
-            <p>Balance: {balance !== null ? `${balance} satoshis` : 'Loading...'}</p>
+            <p>Confirmed Balance: {confirmedBalance !== null ? `${confirmedBalance} satoshis` : 'Loading...'}</p>
+            <p>Unconfirmed Balance: {unconfirmedBalance !== null ? `${unconfirmedBalance} satoshis` : 'Loading...'}</p>
           </div>
         )}
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -257,7 +280,7 @@ const OrdinalCreator: React.FC = () => {
           <Button type="submit" className="w-full" disabled={isLoading || !walletConnected}>
             {isLoading ? 'Creating...' : 'Create Ordinal'}
           </Button>
-        </form>
+          </form>
         
         <div className="mt-8">
           <h3 className="text-lg font-semibold mb-2">Created Ordinals</h3>
