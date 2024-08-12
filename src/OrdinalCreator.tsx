@@ -1,31 +1,133 @@
-import React, { useState, ChangeEvent, FormEvent, useEffect } from 'react';
+import React, { useState, ChangeEvent, FormEvent, useEffect, ReactNode } from 'react';
 import { motion } from 'framer-motion';
 import { Switch } from '@headlessui/react';
-import { AddressPurpose, BitcoinNetworkType, getAddress, GetAddressOptions, signTransaction, SignTransactionOptions } from 'sats-connect';
+import { 
+  AddressPurpose, 
+  BitcoinNetworkType, 
+  getAddress, 
+  GetAddressOptions, 
+  createInscription, 
+  CreateInscriptionOptions, 
+  CreateInscriptionResponse
+} from 'sats-connect';
+import Wallet from 'sats-connect';
 import axios from 'axios';
 
-interface Ordinal {
+interface Inscription {
+  inscriptionId: string;
+  inscriptionNumber: string;
+  parentInscriptionId: string | null;
+  collectionName: string | null;
+  contentType: string;
+  genesisTransaction: string;
+  timestamp: number;
+  satNumber: string;
+  output: string;
+  postage: string;
+}
+
+interface Ordinal extends Inscription {
+  preview: string;
+}
+
+interface CreatedOrdinal {
   id: string;
+  contentType: string;
   content: string;
-  fileType: string;
-  fileData: string | null;
   status: string;
   timestamp: string;
-  txid?: string;
+}
+
+interface InscriptionsResponse {
+  total: number;
+  inscriptions: Inscription[];
+  limit: number;
+  offset: number;
 }
 
 const OrdinalCreator: React.FC = () => {
   const [content, setContent] = useState<string>('');
   const [file, setFile] = useState<File | null>(null);
-  const [preview, setPreview] = useState<string>('');
-  const [ordinals, setOrdinals] = useState<Ordinal[]>([]);
+  const [preview, setPreview] = useState<string>('');  
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [walletConnected, setWalletConnected] = useState<boolean>(false);
   const [publicKey, setPublicKey] = useState<string | null>(null);
-  const [balance, setBalance] = useState<number | null>(null);
   const [isTestnet, setIsTestnet] = useState<boolean>(true);
   const [confirmedBalance, setConfirmedBalance] = useState<number | null>(null);
   const [unconfirmedBalance, setUnconfirmedBalance] = useState<number | null>(null);
+  const [ordinals, setOrdinals] = useState<Ordinal[]>([]);
+  const [isLoadingOrdinals, setIsLoadingOrdinals] = useState<boolean>(false);
+  const [totalInscriptions, setTotalInscriptions] = useState<number>(0);
+  const [createdOrdinals, setCreatedOrdinals] = useState<CreatedOrdinal[]>([]);
+  const [hasPermission, setHasPermission] = useState<boolean>(false);
+  const [currentOffset, setCurrentOffset] = useState<number>(0);
+  const [hasMoreOrdinals, setHasMoreOrdinals] = useState<boolean>(true);
+  const LIMIT = 60; 
+
+  const requestInscriptionPermission = async () => {
+    try {
+      const response = await Wallet.request('wallet_requestPermissions', undefined);
+
+      if (response.status === 'success') {
+        setHasPermission(true);
+        return true;
+      } else {
+        console.error('Permission request failed:', response.error);
+        setHasPermission(false);
+        return false;
+      }
+    } catch (error) {
+      console.error('Error requesting permissions:', error);
+      setHasPermission(false);
+      return false;
+    }
+  };
+
+  const fetchWalletOrdinals = async (offset: number = 0) => {
+    if (!publicKey) return;
+    if (!hasPermission) {
+      const permissionGranted = await requestInscriptionPermission();
+      if (!permissionGranted) {
+        alert('Permission to access inscriptions was denied. Please grant permission to view your ordinals.');
+        return;
+      }
+    }
+
+    setIsLoadingOrdinals(true);
+    try {
+      const response = await Wallet.request('ord_getInscriptions', {
+        offset: offset,
+        limit: LIMIT,
+      });
+
+      if (response.status === 'success') {
+        const data = response.result as unknown as InscriptionsResponse;
+        const fetchedOrdinals: Ordinal[] = data.inscriptions.map(inscription => ({
+          ...inscription,
+          preview: `https://${isTestnet ? 'testnet.' : ''}ordinals.com/content/${inscription.inscriptionId}`
+        }));
+      
+        setOrdinals(prevOrdinals => [...prevOrdinals, ...fetchedOrdinals]);
+        setTotalInscriptions(data.total);
+        setCurrentOffset(offset + fetchedOrdinals.length);
+        setHasMoreOrdinals(fetchedOrdinals.length === LIMIT);
+      } else {
+        console.error('Error fetching inscriptions:', response.error);
+        alert('Failed to fetch inscriptions. Please try again.');
+      }
+    } catch (error) {
+      console.error('Error fetching wallet ordinals:', error);
+      alert('An error occurred while fetching ordinals. Please try again.');
+    } finally {
+      setIsLoadingOrdinals(false);
+    }
+  };
+
+  const loadMoreOrdinals = () => {
+    if (hasMoreOrdinals && !isLoadingOrdinals) {
+      fetchWalletOrdinals(currentOffset);
+    }
+  };
 
   useEffect(() => {
     checkWalletConnection();
@@ -51,12 +153,10 @@ const OrdinalCreator: React.FC = () => {
       
       setConfirmedBalance(confirmedBalance);
       setUnconfirmedBalance(totalBalance - confirmedBalance);
-      setBalance(totalBalance);  // Update the balance state with the total balance
     } catch (error) {
       console.error('Error fetching balance:', error);
       setConfirmedBalance(null);
       setUnconfirmedBalance(null);
-      setBalance(null);  // Also set balance to null in case of an error
     }
   };
 
@@ -70,7 +170,7 @@ const OrdinalCreator: React.FC = () => {
             type: getNetworkType()
           },
         },
-        onFinish: (response: { addresses: { address: string; }[]; }) => {
+        onFinish: (response) => {
           const address = response.addresses[0].address;
           setPublicKey(address);
           setWalletConnected(true);
@@ -108,7 +208,6 @@ const OrdinalCreator: React.FC = () => {
       alert('Please connect your wallet first');
       return;
     }
-    console.log(`Balance: ${balance}`)
     if (confirmedBalance === null || confirmedBalance === 0) {
       alert('Your confirmed balance is insufficient to create an ordinal. Please add funds to your address and wait for confirmation.');
       return;
@@ -116,56 +215,66 @@ const OrdinalCreator: React.FC = () => {
     setIsLoading(true);
 
     try {
-      const ordinalData = {
-        content: content,
-        fileType: file ? file.type : 'text/plain',
-        fileData: file ? await fileToBase64(file) : null,
-      };
+      let inscriptionContent: string;
+      let contentType: string;
+      let payloadType: 'PLAIN_TEXT' | 'BASE_64';
 
-      const txResponse = await fetch('http://localhost:3002/api/prepare-ordinal-tx', {
+      if (file) {
+        inscriptionContent = await fileToBase64(file);
+        contentType = file.type;
+        payloadType = 'BASE_64';
+      } else {
+        inscriptionContent = content;
+        contentType = 'text/plain';
+        payloadType = 'PLAIN_TEXT';
+      }
+
+      console.log('Preparing inscription request with:', { contentType, payloadType });
+
+      const response = await fetch('http://localhost:3002/api/create-inscription', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          ...ordinalData,
+          content: inscriptionContent,
+          contentType,
           address: publicKey,
-          isTestnet: isTestnet,  
+          isTestnet,
         }),
       });
 
-      if (!txResponse.ok) {
-        throw new Error('Failed to prepare ordinal transaction');
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Failed to prepare inscription request: ${errorData.error || response.statusText}`);
       }
 
-      const txDetails = await txResponse.json();
-      console.log('Received PSBT from backend:', txDetails.psbt);
+      const { inscriptionRequest } = await response.json();
+      console.log('Received inscription request:', inscriptionRequest);
 
-      const signPsbtOptions: SignTransactionOptions = {
+      const createInscriptionOptions: CreateInscriptionOptions = {
         payload: {
           network: {
             type: getNetworkType()
           },
-          message: 'Sign transaction to create Bitcoin Ordinal',
-          psbtBase64: txDetails.psbt,
-          broadcast: false,
-          inputsToSign: [
-            {
-              address: publicKey,
-              signingIndexes: [0],
-            },
-          ],
+          contentType,
+          content: inscriptionContent,
+          payloadType,
+          
         },
-        onFinish: (response: { psbtBase64: string; }) => {
-          console.log('Signed transaction:', response);
-          broadcastTransaction(response.psbtBase64);
+        onFinish: (response: CreateInscriptionResponse) => {
+          console.log('Inscription created:', response);
+          alert(`Ordinal created successfully! Transaction ID: ${response.txId}`);
+          addNewOrdinal(response.txId, inscriptionContent, contentType);
         },
         onCancel: () => {
-          throw new Error('Transaction signing was canceled');
+          console.log('Inscription creation was canceled');
+          alert('Inscription creation was canceled');
         },
       };
 
-      await signTransaction(signPsbtOptions);
+      console.log('Calling createInscription with options:', createInscriptionOptions);
+      await createInscription(createInscriptionOptions);
 
     } catch (error) {
       console.error('Error creating ordinal:', error);
@@ -175,60 +284,54 @@ const OrdinalCreator: React.FC = () => {
     }
   };
 
-  const broadcastTransaction = async (signedPsbtBase64: string) => {
-    const broadcastResponse = await fetch('http://localhost:3002/api/broadcast-tx', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ signedTx: signedPsbtBase64, isTestnet: isTestnet }),
-    });
-
-    if (!broadcastResponse.ok) {
-      throw new Error('Failed to broadcast transaction');
-    }
-
-    const broadcastResult = await broadcastResponse.json();
-
-    const newOrdinal: Ordinal = {
-      id: broadcastResult.txid,
-      content: content,
-      fileType: file ? file.type : 'text/plain',
-      fileData: file ? await fileToBase64(file) : null,
-      status: 'broadcasted',
-      timestamp: new Date().toISOString(),
-      txid: broadcastResult.txid,
-    };
-
-    setOrdinals([...ordinals, newOrdinal]);
-
-    setContent('');
-    setFile(null);
-    setPreview('');
-
-    alert(`Ordinal created successfully! Transaction ID: ${broadcastResult.txid}`);
-  };
-
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => resolve(reader.result as string);
+      reader.readAsArrayBuffer(file);
+      reader.onload = () => {
+        const arrayBuffer = reader.result as ArrayBuffer;
+        const bytes = new Uint8Array(arrayBuffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64 = btoa(binary);
+        resolve(base64);
+      };
       reader.onerror = error => reject(error);
     });
   };
 
+  const addNewOrdinal = (txid: string, inscriptionContent: string, contentType: string) => {
+    const newOrdinal: CreatedOrdinal = {
+      id: txid,
+      contentType: contentType,
+      content: inscriptionContent,
+      status: 'created',
+      timestamp: new Date().toISOString(),
+    };
+
+    setCreatedOrdinals(prevOrdinals => [...prevOrdinals, newOrdinal]);
+  };
+
+  useEffect(() => {
+    if (publicKey) {
+      setOrdinals([]);
+      setCurrentOffset(0);
+      setHasMoreOrdinals(true);
+      setHasPermission(false); // Reset permission state when public key changes
+      fetchWalletOrdinals(0);
+    }
+  }, [publicKey, isTestnet]);
+  
+  // Update the toggleNetwork function to clear ordinals when switching networks
   const toggleNetwork = () => {
     setIsTestnet(!isTestnet);
     setWalletConnected(false);
     setPublicKey(null);
-    setBalance(null);
     setConfirmedBalance(null);
     setUnconfirmedBalance(null);
-    // If a wallet is connected, check the balance for the new network
-    if (publicKey) {
-      checkBalance(publicKey);
-    }
+    setOrdinals([]); // Clear the ordinals when switching networks
   };
 
   return (
@@ -349,34 +452,86 @@ const OrdinalCreator: React.FC = () => {
         </motion.div>
 
         <motion.div
-          initial={{ opacity: 0, y: 50 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.5 }}
-          className="mt-12"
-        >
-          <h3 className="text-2xl font-bold mb-4">Created Ordinals</h3>
-          <div className="space-y-4">
-            {ordinals.map((ordinal) => (
-              <motion.div
-                key={ordinal.id}
-                className="bg-gray-800 rounded-lg p-4 shadow-md"
-                initial={{ opacity: 0, x: -50 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ duration: 0.3 }}
+        initial={{ opacity: 0, y: 50 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.5 }}
+        className="mt-12"
+      >
+        <h3 className="text-2xl font-bold mb-4">Wallet Ordinals ({isTestnet ? 'Testnet' : 'Mainnet'})</h3>
+        <p>Total Inscriptions: {totalInscriptions}</p>
+        {isLoadingOrdinals && ordinals.length === 0 ? (
+          <p>Loading wallet ordinals...</p>
+        ) : ordinals.length > 0 ? (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {ordinals.map((ordinal) => (
+                <motion.div
+                  key={ordinal.inscriptionId}
+                  className="bg-gray-800 rounded-lg p-4 shadow-md"
+                  initial={{ opacity: 0, scale: 0.9 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  <img 
+                    src={'https://ord-testnet.xverse.app/content/' + ordinal.inscriptionId} 
+                    alt={`Ordinal ${ordinal.inscriptionNumber}`} 
+                    className="w-full h-40 object-cover rounded-md mb-2"
+                  />
+                  <p><strong>Inscription Number:</strong> {ordinal.inscriptionNumber}</p>
+                  <p><strong>Content Type:</strong> {ordinal.contentType}</p>
+                  <p><strong>Transaction ID:</strong> {ordinal.genesisTransaction.slice(0, 10)}...</p>
+                  <p><strong>Timestamp:</strong> {new Date(ordinal.timestamp * 1000).toLocaleString()}</p>
+                </motion.div>
+              ))}
+            </div>
+            {hasMoreOrdinals && (
+              <button 
+                onClick={loadMoreOrdinals}
+                className="mt-4 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors"
+                disabled={isLoadingOrdinals}
               >
-                <p><strong>ID:</strong> {ordinal.id}</p>
-                <p><strong>Content:</strong> {ordinal.content}</p>
-                <p><strong>File Type:</strong> {ordinal.fileType}</p>
-                <p><strong>Status:</strong> {ordinal.status}</p>
-                <p><strong>Timestamp:</strong> {ordinal.timestamp}</p>
-                {ordinal.txid && <p><strong>Transaction ID:</strong> {ordinal.txid}</p>}
-                {ordinal.fileData && ordinal.fileType.startsWith('image/') && (
-                  <img src={ordinal.fileData} alt="Ordinal" className="mt-2 max-w-full h-auto rounded-md" />
-                )}
-              </motion.div>
-            ))}
-          </div>
-        </motion.div>
+                {isLoadingOrdinals ? 'Loading...' : 'Load More'}
+              </button>
+            )}
+          </>
+        ) : (
+          <p>No ordinals found in this wallet on {isTestnet ? 'testnet' : 'mainnet'}.</p>
+        )}
+      </motion.div>
+
+      <motion.div
+        initial={{ opacity: 0, y: 50 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.5 }}
+        className="mt-12"
+      >
+        <h3 className="text-2xl font-bold mb-4">Created Ordinals</h3>
+        <div className="space-y-4">
+          {createdOrdinals.map((ordinal) => (
+            <motion.div
+              key={ordinal.id}
+              className="bg-gray-800 rounded-lg p-4 shadow-md"
+              initial={{ opacity: 0, x: -50 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.3 }}
+            >
+              <p><strong>Transaction ID:</strong> {ordinal.id}</p>
+              <p><strong>Content Type:</strong> {ordinal.contentType}</p>
+              <p><strong>Status:</strong> {ordinal.status}</p>
+              <p><strong>Timestamp:</strong> {new Date(ordinal.timestamp).toLocaleString()}</p>
+              {ordinal.contentType.startsWith('image/') ? (
+                <img 
+                  src={`data:${ordinal.contentType};base64,${ordinal.content}`} 
+                  alt="Ordinal" 
+                  className="mt-2 max-w-full h-auto rounded-md" 
+                />
+              ) : (
+                <p><strong>Content:</strong> {ordinal.content.slice(0, 100)}...</p>
+              )}
+            </motion.div>
+          ))}
+        </div>
+      </motion.div>
       </div>
     </motion.div>
   );
